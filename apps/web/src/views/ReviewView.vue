@@ -5,12 +5,22 @@ import { createSHA256 } from "hash-wasm";
 import WaveformPlayer, { type WaveAnnotation } from "../components/WaveformPlayer.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { apiFetch, ApiError } from "../api/client.js";
+import {
+  clearProgress,
+  fetchUploadState,
+  findStoredUpload,
+  readProgress,
+  rememberUpload,
+  uploadResumableParallel,
+  type UploadDescriptor,
+} from "../api/resumable-upload.js";
 import { annotationLabels, formatBytes, formatTimeMs, parseTimeInput } from "../utils/format.js";
 
 type AnnotationType = "RHYTHM" | "FINGERING" | "EMOTION";
 interface Media {
-  id: string; status: string; originalName: string; mimeType: string; sizeBytes: number | string; durationMs: number | null;
+  id: string; status: string; audioObjectId?: string | null; originalName: string; mimeType: string; sizeBytes: number | string; durationMs: number | null;
   codec: string | null; sampleRate: number | null; channels: number | null; peaks: number[] | null; failureCode: string | null; failureMessage: string | null;
+  audioObject?: { id: string; status: string } | null;
 }
 interface Annotation {
   id: string; mediaId: string; type: AnnotationType; severity: number; startMs: number | string; endMs: number | string;
@@ -199,20 +209,10 @@ async function sha256(file: File): Promise<string> {
   return hasher.digest("hex");
 }
 
-function uploadPut(url: string, file: File, mimeType: string, digest: string, onProgress: (value: number) => void): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    request.open("PUT", url);
-    request.setRequestHeader("Content-Type", mimeType);
-    request.setRequestHeader("x-amz-meta-sha256", digest);
-    request.upload.onprogress = (event) => {
-      if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
-    };
-    request.onload = () => request.status >= 200 && request.status < 300 ? resolve() : reject(new Error(`对象存储返回 ${request.status}`));
-    request.onerror = () => reject(new Error("上传连接中断"));
-    request.ontimeout = () => reject(new Error("上传超时"));
-    request.send(file);
-  });
+interface InitUploadResponse {
+  media: Media;
+  reused: boolean;
+  upload: UploadDescriptor | null;
 }
 
 async function pollMedia(upload: UploadItem): Promise<void> {
@@ -239,6 +239,134 @@ async function pollMedia(upload: UploadItem): Promise<void> {
   upload.error = "音频解析超时，可点击重试";
 }
 
+async function completeAndPoll(upload: UploadItem): Promise<void> {
+  for (;;) {
+    try {
+      await apiFetch<{ media: Media; reused: boolean; probeQueued: boolean }>(
+        `/api/v1/media/${upload.mediaId}/complete-upload`,
+        { method: "POST", body: "{}" },
+      );
+      break;
+    } catch (reason) {
+      // 同摘要并发确认时，另一请求正在合并对象：等待后再查，不重复上传
+      if (reason instanceof ApiError && reason.code === "MEDIA_FINALIZING") {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        continue;
+      }
+      throw reason;
+    }
+  }
+  await pollMedia(upload);
+}
+
+async function uploadOne(item: UploadItem, file: File, digest: string, mimeType: string): Promise<void> {
+  // 页面重开后：若本地缓存存在同摘要会话，先尝试续传缺失分片而不是新建
+  const stored = findStoredUpload(file, digest);
+  let mediaId = stored?.mediaId;
+  let descriptor: UploadDescriptor | null = null;
+
+  if (stored) {
+    item.mediaId = stored.mediaId;
+    const state = await fetchUploadState(stored.mediaId).catch(() => null);
+    if (state) descriptor = state;
+  }
+
+  const createSession = async (): Promise<"reused" | "uploading"> => {
+    item.status = "创建上传会话";
+    const creation = await apiFetch<InitUploadResponse>(
+      `/api/v1/sessions/${session.value!.id}/media/uploads`,
+      { method: "POST", body: JSON.stringify({ originalName: file.name, mimeType, sizeBytes: file.size, sha256: digest }) },
+    );
+    mediaId = creation.media.id;
+    item.mediaId = mediaId;
+    // 旧的本地续传记录指向已失效会话，避免 ETag 缓存串用
+    if (stored && stored.mediaId !== mediaId) clearProgress(stored.mediaId);
+    if (creation.reused || !creation.upload) {
+      item.status = "READY";
+      item.progress = 100;
+      const reused = await apiFetch<{ media: Media }>(`/api/v1/media/${mediaId}`);
+      const index = session.value!.mediaAssets.findIndex((media) => media.id === reused.media.id);
+      if (index >= 0) session.value!.mediaAssets[index] = reused.media;
+      else session.value!.mediaAssets.push(reused.media);
+      await selectMedia(reused.media.id);
+      clearProgress(mediaId);
+      return "reused";
+    }
+    descriptor = creation.upload;
+    rememberUpload(mediaId, file, digest, descriptor);
+    return "uploading";
+  };
+
+  if (!descriptor) {
+    if ((await createSession()) === "reused") return;
+  }
+
+  item.status = "上传中";
+  let recreateCount = 0;
+  const runUpload = async (): Promise<void> => {
+    if (!descriptor || !mediaId) throw new Error("上传会话未初始化");
+    const activeDescriptor = descriptor;
+    const activeMediaId = mediaId;
+    await uploadResumableParallel(
+      {
+        mediaId: activeMediaId,
+        file,
+        descriptor: activeDescriptor,
+        knownParts: readProgress(activeMediaId)?.parts,
+        onProgress: (uploadedBytes, totalBytes) => {
+          item.progress = Math.min(99, Math.round((uploadedBytes / totalBytes) * 100));
+        },
+      },
+    );
+
+    item.status = "等待系统校验";
+    item.progress = 100;
+    try {
+      await completeAndPoll(item);
+    } catch (reason) {
+      // 服务端发现仍缺分片（例如最后一片响应丢失）：刷新状态后只补缺失分片，再确认
+      if (reason instanceof ApiError && reason.code === "UPLOAD_PARTS_INCOMPLETE") {
+        item.status = "续传缺失分片";
+        const refreshed = await fetchUploadState(mediaId!);
+        if (!refreshed) throw reason;
+        descriptor = refreshed;
+        await runUpload();
+        return;
+      }
+      // 分片会话已被回收：重新创建会话后重传（新会话无已存在分片）
+      if (reason instanceof ApiError && reason.code === "UPLOAD_SESSION_MISSING" && recreateCount < 1) {
+        recreateCount += 1;
+        item.status = "重建上传会话";
+        if (mediaId) clearProgress(mediaId);
+        descriptor = null;
+        if ((await createSession()) === "reused") return;
+        await runUpload();
+        return;
+      }
+      throw reason;
+    }
+  };
+  try {
+    await runUpload();
+  } catch (reason) {
+    // 上传阶段发现会话失效（被回收/过期）：自动重建一次，避免用户手工重试
+    if (
+      reason instanceof ApiError &&
+      ["UPLOAD_SESSION_MISSING", "UPLOAD_SESSION_EXPIRED"].includes(reason.code) &&
+      recreateCount < 1
+    ) {
+      recreateCount += 1;
+      item.status = "重建上传会话";
+      if (mediaId) clearProgress(mediaId);
+      descriptor = null;
+      if ((await createSession()) === "uploading") await runUpload();
+    } else {
+      throw reason;
+    }
+  }
+  if (item.mediaId) clearProgress(item.mediaId);
+}
+
 async function uploadFiles(files: FileList | File[]): Promise<void> {
   for (const file of Array.from(files)) {
     const item = reactive<UploadItem>({ id: `${Date.now()}-${file.name}`, file, status: "计算摘要", progress: 0 });
@@ -246,24 +374,7 @@ async function uploadFiles(files: FileList | File[]): Promise<void> {
     try {
       const digest = await sha256(file);
       const mimeType = mediaType(file);
-      const creation = await apiFetch<{ media: { id: string }; reused: boolean; uploadUrl: string | null; requiredHeaders: Record<string, string> }>(
-        `/api/v1/sessions/${session.value!.id}/media/uploads`,
-        { method: "POST", body: JSON.stringify({ originalName: file.name, mimeType, sizeBytes: file.size, sha256: digest }) },
-      );
-      item.mediaId = creation.media.id;
-      if (creation.reused) {
-        item.status = "READY";
-        item.progress = 100;
-        const reused = await apiFetch<{ media: Media }>(`/api/v1/media/${creation.media.id}`);
-        session.value!.mediaAssets.push(reused.media);
-        await selectMedia(reused.media.id);
-        continue;
-      }
-      item.status = "上传中";
-      await uploadPut(creation.uploadUrl!, file, mimeType, digest, (progress) => { item.progress = progress; });
-      item.status = "等待系统校验";
-      await apiFetch(`/api/v1/media/${creation.media.id}/complete-upload`, { method: "POST", body: "{}" });
-      await pollMedia(item);
+      await uploadOne(item, file, digest, mimeType);
     } catch (reason) {
       item.status = "FAILED";
       item.error = reason instanceof ApiError ? reason.message : reason instanceof Error ? reason.message : "上传失败";
@@ -272,8 +383,27 @@ async function uploadFiles(files: FileList | File[]): Promise<void> {
 }
 
 async function retryUpload(item: UploadItem): Promise<void> {
-  uploads.value = uploads.value.filter((upload) => upload.id !== item.id);
-  await uploadFiles([item.file]);
+  item.error = undefined;
+  item.status = "计算摘要";
+  item.progress = 0;
+  try {
+    const digest = await sha256(item.file);
+    await uploadOne(item, item.file, digest, mediaType(item.file));
+  } catch (reason) {
+    item.status = "FAILED";
+    item.error = reason instanceof ApiError ? reason.message : reason instanceof Error ? reason.message : "重试失败";
+  }
+}
+
+function handleNetworkBack(): void {
+  // 网络恢复时不做额外动作：进行中的分片循环会自行退避重试，
+  // 并通过 upload-state 只续传对象存储中缺失的分片。
+  const hasActive = uploads.value.some((item) => !["READY", "FAILED", "CANCELLED"].includes(item.status));
+  if (hasActive && navigator.onLine) {
+    uploads.value.forEach((item) => {
+      if (item.status === "FAILED" && item.error?.includes("中断")) void retryUpload(item);
+    });
+  }
 }
 
 function onDrop(event: DragEvent): void {
@@ -379,8 +509,14 @@ function setLoopFromAnnotation(): void {
 }
 
 watch(() => [reviewForm.goodPoints, reviewForm.mainIssues, reviewForm.nextFocus, reviewForm.noIssues, reviewForm.suggestedNextPracticeAt], scheduleReviewSave);
-onBeforeUnmount(() => clearTimeout(saveTimer));
-onMounted(loadSession);
+onBeforeUnmount(() => {
+  clearTimeout(saveTimer);
+  window.removeEventListener("online", handleNetworkBack);
+});
+onMounted(() => {
+  window.addEventListener("online", handleNetworkBack);
+  void loadSession();
+});
 </script>
 
 <template>
@@ -418,6 +554,7 @@ onMounted(loadSession);
             <input type="file" accept="audio/*,.mp3,.m4a,.wav,.ogg,.flac,.webm" multiple hidden :disabled="!['DRAFT', 'IN_REVIEW'].includes(session.status)" @change="($event.target as HTMLInputElement).files && uploadFiles(($event.target as HTMLInputElement).files!)" />
             <strong>拖入音频或点击选择</strong>
             <small>MP3 / M4A / WAV / OGG / FLAC / WebM，单文件最多 200 MB</small>
+            <small class="muted">断网自动等待恢复，仅续传缺失分片；相同内容只存一份</small>
           </label>
 
           <div class="stack media-list">

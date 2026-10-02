@@ -1,4 +1,16 @@
-import { CreateBucketCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateBucketCommand,
+  CreateMultipartUploadCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadBucketCommand,
+  HeadObjectCommand,
+  ListPartsCommand,
+  S3Client,
+  UploadPartCommand,
+} from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
@@ -37,24 +49,6 @@ export function publicObjectUrl(objectKey: string): string {
   return `${base}/${config.S3_BUCKET}/${objectKey.split("/").map(encodeURIComponent).join("/")}`;
 }
 
-export async function createUploadUrl(objectKey: string, mimeType: string, sha256: string): Promise<string> {
-  const config = getConfig();
-  return getSignedUrl(
-    getPublicS3(),
-    new PutObjectCommand({
-      Bucket: config.S3_BUCKET,
-      Key: objectKey,
-      ContentType: mimeType,
-      Metadata: { sha256 },
-    }),
-    {
-      expiresIn: config.UPLOAD_URL_TTL_SECONDS,
-      signableHeaders: new Set(["content-type"]),
-      unhoistableHeaders: new Set(["x-amz-meta-sha256"]),
-    },
-  );
-}
-
 export async function createPlaybackUrl(objectKey: string, originalName: string, contentType?: string): Promise<string> {
   const config = getConfig();
   return getSignedUrl(
@@ -89,9 +83,93 @@ export async function verifyObject(objectKey: string, expectedSize: bigint, expe
   const hash = createHash("sha256");
   for await (const chunk of object.Body as Readable) hash.update(chunk as Buffer);
   if (hash.digest("hex") !== expectedSha256.toLowerCase()) {
-    await deleteObject(objectKey).catch(() => undefined);
+    // 不删除对象：Key 为内容寻址，可能存在历史失败对象；重新分片合并会整体覆盖。
     throw new AppError(400, "UPLOAD_HASH_MISMATCH", "上传文件摘要与声明不一致，请重新上传");
   }
+}
+
+export async function createMultipartUpload(objectKey: string, mimeType: string, sha256: string): Promise<string> {
+  const config = getConfig();
+  const result = await getS3().send(
+    new CreateMultipartUploadCommand({
+      Bucket: config.S3_BUCKET,
+      Key: objectKey,
+      ContentType: mimeType,
+      Metadata: { sha256 },
+    }),
+  );
+  if (!result.UploadId) throw new Error("S3 未返回 UploadId");
+  return result.UploadId;
+}
+
+export async function createPartUploadUrl(objectKey: string, uploadId: string, partNumber: number): Promise<string> {
+  const config = getConfig();
+  return getSignedUrl(
+    getPublicS3(),
+    new UploadPartCommand({ Bucket: config.S3_BUCKET, Key: objectKey, UploadId: uploadId, PartNumber: partNumber }),
+    { expiresIn: config.UPLOAD_URL_TTL_SECONDS },
+  );
+}
+
+export interface UploadedPartInfo {
+  partNumber: number;
+  sizeBytes: number;
+  etag: string;
+}
+
+/** 以对象存储服务端记录为准，列出分片上传会话中已存在的分片；缺失对象时返回 null。 */
+export async function listUploadedParts(objectKey: string, uploadId: string): Promise<UploadedPartInfo[] | null> {
+  const config = getConfig();
+  const parts: UploadedPartInfo[] = [];
+  let marker: string | undefined;
+  for (;;) {
+    try {
+      const result = await getS3().send(
+        new ListPartsCommand({ Bucket: config.S3_BUCKET, Key: objectKey, UploadId: uploadId, PartNumberMarker: marker }),
+      );
+      for (const part of result.Parts ?? []) {
+        if (part.PartNumber != null && part.ETag) {
+          parts.push({ partNumber: part.PartNumber, sizeBytes: Number(part.Size ?? 0), etag: part.ETag.replace(/"/g, "") });
+        }
+      }
+      if (!result.IsTruncated) break;
+      marker = result.NextPartNumberMarker != null ? String(result.NextPartNumberMarker) : (parts.at(-1) ? String(parts.at(-1)!.partNumber) : undefined);
+      if (marker == null) break;
+    } catch (error) {
+      const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+      if (status === 404) return null;
+      throw error;
+    }
+  }
+  parts.sort((a, b) => a.partNumber - b.partNumber);
+  return parts;
+}
+
+export async function abortMultipartUpload(objectKey: string, uploadId: string): Promise<boolean> {
+  const config = getConfig();
+  try {
+    await getS3().send(new AbortMultipartUploadCommand({ Bucket: config.S3_BUCKET, Key: objectKey, UploadId: uploadId }));
+    return true;
+  } catch (error) {
+    if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) return false;
+    throw error;
+  }
+}
+
+export async function completeMultipartUpload(
+  objectKey: string,
+  uploadId: string,
+  parts: Array<{ partNumber: number; etag: string }>,
+): Promise<void> {
+  const config = getConfig();
+  await getS3().send(
+    new CompleteMultipartUploadCommand({
+      Bucket: config.S3_BUCKET,
+      Key: objectKey,
+      UploadId: uploadId,
+      MultipartUpload: { Parts: parts.map((part) => ({ PartNumber: part.partNumber, ETag: `"${part.etag}"` })) },
+    }),
+  );
 }
 
 export async function deleteObject(objectKey: string): Promise<void> {

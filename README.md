@@ -85,6 +85,8 @@ npm run test:e2e
 | `S3_PUBLIC_ENDPOINT` | 浏览器预签名地址 | `http://localhost:9000` |
 | `S3_BUCKET` | 私有音频 Bucket | `practice-audio` |
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` | S3 凭证 | 通过 Secret 注入 |
+| `MULTIPART_PART_SIZE_MB` | 分片大小（5–100 MB），默认 8 | `8` |
+| `MULTIPART_TTL_HOURS` | 未完成分片会话保留时长，超时由 Worker 回收 | `24` |
 | `WEB_ORIGIN` | 允许的 Web 来源列表，逗号分隔 | `https://app.example.com` |
 | `PUBLIC_API_ORIGIN` | 对外 API 地址，用于 Cookie Secure 判断 | `https://api.example.com` |
 
@@ -95,8 +97,9 @@ npm run test:e2e
 - 密码使用 Argon2id；Access Token 只在浏览器内存保存。
 - Refresh Token 使用 `HttpOnly` Cookie 并每次轮换；检测到复用会撤销同一会话族。
 - 音频 Bucket 保持私有，播放 URL 默认 300 秒过期。
-- 上传先创建 `MediaAsset`，对象直传 S3/MinIO，确认时流式计算 SHA-256。
-- 同一用户重复上传相同 SHA-256 时复用已有对象，新练习只创建业务关联，不重复占用存储。
+- 上传先创建 `MediaAsset` 引用，浏览器通过 S3 Multipart Upload 分片直传，确认时服务端流式计算 SHA-256。
+- 物理对象按「用户 + SHA-256」内容寻址并由数据库唯一约束保证；断网恢复只续传缺失分片，同摘要并发确认只合并一次，相同内容永远只占一份存储。
+- 引用创建、复用确认与删除全程写入 `media_object_events`；最后一个引用移除才删除物理对象，删除失败保留事件以便追溯和重试。
 - Worker 禁止拼接 Shell 命令，统一使用参数数组调用 `ffprobe/ffmpeg`。
 - 所有资源查询都带 `userId` 条件，无法通过 ID 访问其他用户资源。
 - 删除练习进入后台清理队列，失败时保留 `DELETE_FAILED` 以便重试和审计。

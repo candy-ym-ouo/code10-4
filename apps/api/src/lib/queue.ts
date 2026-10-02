@@ -11,12 +11,43 @@ export function getMediaQueue(): Queue {
   return queue;
 }
 
-export async function enqueueProbe(mediaId: string): Promise<void> {
-  await getMediaQueue().add(
+/**
+ * 投递音频探测任务。同一物理对象使用稳定 jobId，
+ * BullMQ 自动去重，避免同摘要并发确认触发重复探测。
+ * 已完成/失败但尚未过期的同 ID 任务会先移除再投递，保证 retry-probe 可用。
+ */
+export async function enqueueProbe(audioObjectId: string, extra: { legacyMediaId?: string } = {}): Promise<void> {
+  const queue = getMediaQueue();
+  if (extra.legacyMediaId) {
+    // 兼容回填前的历史任务，不做去重
+    await queue.add(
+      "probe-media",
+      { mediaId: extra.legacyMediaId },
+      {
+        jobId: `probe-legacy:${extra.legacyMediaId}:${Date.now()}`,
+        attempts: 3,
+        backoff: { type: "exponential", delay: 3000 },
+        removeOnComplete: 100,
+        removeOnFail: 500,
+      },
+    );
+    return;
+  }
+
+  const jobId = `probe:${audioObjectId}`;
+  const existing = await queue.getJob(jobId);
+  if (existing) {
+    const state = await existing.getState();
+    if (state === "active" || state === "waiting" || state === "waiting-children" || state === "delayed" || state === "prioritized") {
+      return; // 已有探测在排队或运行，依赖幂等，不重复投递
+    }
+    await existing.remove();
+  }
+  await queue.add(
     "probe-media",
-    { mediaId },
+    { audioObjectId },
     {
-      jobId: `probe:${mediaId}:${Date.now()}`,
+      jobId,
       attempts: 3,
       backoff: { type: "exponential", delay: 3000 },
       removeOnComplete: 100,

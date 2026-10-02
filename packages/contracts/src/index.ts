@@ -261,6 +261,44 @@ export function calculateSessionDuration(mediaDurationsMs: Array<number | null |
   return mediaDurationsMs.reduce<number>((total, duration) => total + (duration && duration > 0 ? duration : 0), 0);
 }
 
+/** S3 Multipart Upload 单个分片最小 5 MiB（最后一片除外）。 */
+export const MULTIPART_MIN_PART_BYTES = 5 * 1024 * 1024;
+/** 默认分片大小 8 MiB，网络恢复后只需续传缺失分片。 */
+export const MULTIPART_DEFAULT_PART_BYTES = 8 * 1024 * 1024;
+/** S3 Multipart Upload 分片数上限。 */
+export const MULTIPART_MAX_PART_COUNT = 10_000;
+
+export interface MultipartPlan {
+  partSizeBytes: number;
+  partCount: number;
+}
+
+/**
+ * 根据文件大小规划分片：保证每片（除最后一片）不小于 S3 的 5 MiB 下限，
+ * 且分片总数不超过 10_000。
+ */
+export function planMultipart(sizeBytes: number, preferredPartBytes = MULTIPART_DEFAULT_PART_BYTES): MultipartPlan {
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) {
+    throw new Error("文件大小必须是正整数");
+  }
+  const preferred = Math.max(preferredPartBytes, MULTIPART_MIN_PART_BYTES);
+  let partSizeBytes = preferred;
+  if (Math.ceil(sizeBytes / partSizeBytes) > MULTIPART_MAX_PART_COUNT) {
+    partSizeBytes = Math.ceil(sizeBytes / MULTIPART_MAX_PART_COUNT);
+  }
+  return { partSizeBytes, partCount: Math.ceil(sizeBytes / partSizeBytes) };
+}
+
+/** 计算指定分片在文件中的字节偏移区间 [start, end)。 */
+export function partByteRange(partNumber: number, partSizeBytes: number, sizeBytes: number): { start: number; end: number } {
+  const start = (partNumber - 1) * partSizeBytes;
+  const end = Math.min(start + partSizeBytes, sizeBytes);
+  if (start < 0 || start >= sizeBytes || end <= start) {
+    throw new Error(`分片 ${partNumber} 超出文件范围`);
+  }
+  return { start, end };
+}
+
 export function describeMissingReview(input: {
   readyMediaCount: number;
   annotationCount: number;

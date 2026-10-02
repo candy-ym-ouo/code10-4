@@ -4,6 +4,8 @@ import {
   canTransitionSession,
   describeMissingReview,
   isGoalProgressValid,
+  partByteRange,
+  planMultipart,
   validateAnnotationRange,
 } from "../src/index.js";
 
@@ -46,5 +48,37 @@ describe("goal values", () => {
 
   it("sums only valid media durations", () => {
     expect(calculateSessionDuration([1000, null, 2500, -1])).toBe(3500);
+  });
+});
+
+describe("multipart upload planning", () => {
+  it("uses the preferred part size for small files and keeps the last part shorter", () => {
+    const plan = planMultipart(20 * 1024 * 1024);
+    expect(plan.partCount).toBe(3);
+    expect(plan.partSizeBytes).toBe(8 * 1024 * 1024);
+    expect(partByteRange(3, plan.partSizeBytes, 20 * 1024 * 1024)).toEqual({
+      start: 16 * 1024 * 1024,
+      end: 20 * 1024 * 1024,
+    });
+  });
+
+  it("never plans parts below 5 MiB except the last", () => {
+    const size = 9 * 1024 * 1024;
+    const plan = planMultipart(size);
+    expect(plan.partCount).toBe(2);
+    expect(plan.partSizeBytes).toBe(8 * 1024 * 1024);
+    expect(partByteRange(1, plan.partSizeBytes, size)).toEqual({ start: 0, end: 8 * 1024 * 1024 });
+    expect(partByteRange(2, plan.partSizeBytes, size)).toEqual({ start: 8 * 1024 * 1024, end: size });
+  });
+
+  it("grows part size for huge files to stay within the part limit", () => {
+    const size = 500 * 1024 * 1024;
+    const plan = planMultipart(size);
+    expect(plan.partCount).toBeLessThanOrEqual(10_000);
+    expect(plan.partSizeBytes).toBeGreaterThanOrEqual(5 * 1024 * 1024);
+  });
+
+  it("rejects non-positive sizes", () => {
+    expect(() => planMultipart(0)).toThrow();
   });
 });

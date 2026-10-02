@@ -1,4 +1,11 @@
-import { GetObjectCommand, PutObjectCommand, S3Client, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import {
+  AbortMultipartUploadCommand,
+  GetObjectCommand,
+  ListMultipartUploadsCommand,
+  PutObjectCommand,
+  S3Client,
+  DeleteObjectCommand,
+} from "@aws-sdk/client-s3";
 import type { Readable } from "node:stream";
 import { getConfig } from "../config/env.js";
 
@@ -36,4 +43,41 @@ export async function putObject(objectKey: string, body: string, contentType: st
 
 export async function deleteObject(objectKey: string): Promise<void> {
   await getS3().send(new DeleteObjectCommand({ Bucket: getConfig().S3_BUCKET, Key: objectKey }));
+}
+
+export interface InProgressUpload {
+  key: string;
+  uploadId: string;
+  initiated: Date | undefined;
+}
+
+/** 列出 Bucket 中所有进行中的分片上传（用于回收过期会话）。 */
+export async function listInProgressUploads(): Promise<InProgressUpload[]> {
+  const bucket = getConfig().S3_BUCKET;
+  const uploads: InProgressUpload[] = [];
+  let marker: string | undefined;
+  for (;;) {
+    const result = await getS3().send(new ListMultipartUploadsCommand({ Bucket: bucket, KeyMarker: marker }));
+    for (const upload of result.Uploads ?? []) {
+      if (upload.Key && upload.UploadId) {
+        uploads.push({ key: upload.Key, uploadId: upload.UploadId, initiated: upload.Initiated });
+      }
+    }
+    if (!result.IsTruncated) break;
+    marker = result.NextKeyMarker;
+    if (!marker) break;
+  }
+  return uploads;
+}
+
+export async function abortMultipartUpload(objectKey: string, uploadId: string): Promise<boolean> {
+  try {
+    await getS3().send(
+      new AbortMultipartUploadCommand({ Bucket: getConfig().S3_BUCKET, Key: objectKey, UploadId: uploadId }),
+    );
+    return true;
+  } catch (error) {
+    if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) return false;
+    throw error;
+  }
 }

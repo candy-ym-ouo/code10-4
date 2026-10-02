@@ -32,6 +32,21 @@ enum MediaStatus {
   CANCELLED
 }
 
+enum AudioObjectStatus {
+  UPLOADING
+  UPLOADED
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum UploadAttemptStatus {
+  ACTIVE
+  COMPLETED
+  ABORTED
+  FAILED
+}
+
 enum AnnotationType {
   RHYTHM
   FINGERING
@@ -95,6 +110,8 @@ model User {
   refreshSessions   RefreshSession[]
   practiceSessions  PracticeSession[]
   mediaAssets       MediaAsset[]
+  audioObjects      AudioObject[]
+  uploadAttempts    UploadAttempt[]
   annotations       Annotation[]
   goals             Goal[]
   goalProgresses    GoalProgress[]
@@ -152,10 +169,81 @@ model PracticeSession {
   @@map("practice_sessions")
 }
 
+model AudioObject {
+  id           String            @id @default(uuid()) @db.Uuid
+  userId       String            @map("user_id") @db.Uuid
+  status       AudioObjectStatus @default(UPLOADING)
+  objectKey    String            @unique @map("object_key")
+  sha256       String            @db.Char(64)
+  sizeBytes    BigInt            @map("size_bytes")
+  mimeType     String?           @map("mime_type") @db.VarChar(100)
+  durationMs   BigInt?           @map("duration_ms")
+  codec        String?           @db.VarChar(64)
+  sampleRate   Int?              @map("sample_rate")
+  channels     Int?              @db.SmallInt
+  peaks        Json?
+  failureCode  String?           @map("failure_code") @db.VarChar(64)
+  failureMessage String?         @map("failure_message") @db.VarChar(500)
+  uploadedAt   DateTime?         @map("uploaded_at") @db.Timestamptz(6)
+  processedAt  DateTime?         @map("processed_at") @db.Timestamptz(6)
+  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime          @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mediaAssets  MediaAsset[]
+  uploadAttempts UploadAttempt[]
+
+  @@unique([userId, sha256])
+  @@index([userId, status])
+  @@map("audio_objects")
+}
+
+model UploadAttempt {
+  id             String             @id @default(uuid()) @db.Uuid
+  audioObjectId  String             @map("audio_object_id") @db.Uuid
+  userId         String             @map("user_id") @db.Uuid
+  uploadId       String             @unique @map("upload_id") @db.VarChar(255)
+  status         UploadAttemptStatus @default(ACTIVE)
+  partSizeBytes  BigInt             @map("part_size_bytes")
+  partCount      Int                @map("part_count")
+  parts          Json
+  expiresAt      DateTime           @map("expires_at") @db.Timestamptz(6)
+  completedAt    DateTime?          @map("completed_at") @db.Timestamptz(6)
+  failureCode    String?            @map("failure_code") @db.VarChar(64)
+  failureMessage String?            @map("failure_message") @db.VarChar(500)
+  createdAt      DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
+  audioObject    AudioObject        @relation(fields: [audioObjectId], references: [id], onDelete: Cascade)
+  user           User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([audioObjectId, status])
+  @@index([status, expiresAt])
+  @@map("upload_attempts")
+}
+
+model MediaObjectEvent {
+  id            String      @id @default(uuid()) @db.Uuid
+  audioObjectId String?     @map("audio_object_id") @db.Uuid
+  userId        String?     @map("user_id") @db.Uuid
+  mediaAssetId  String?     @map("media_asset_id") @db.Uuid
+  sessionId     String?     @map("session_id") @db.Uuid
+  action        String      @db.VarChar(64)
+  result        String      @db.VarChar(32)
+  objectKey     String?     @map("object_key")
+  sha256       String?     @db.Char(64)
+  detail        Json?
+  createdAt     DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([audioObjectId, createdAt])
+  @@index([mediaAssetId, createdAt])
+  @@index([userId, createdAt])
+  @@map("media_object_events")
+}
+
 model MediaAsset {
   id             String          @id @default(uuid()) @db.Uuid
   userId         String          @map("user_id") @db.Uuid
   sessionId      String          @map("session_id") @db.Uuid
+  audioObjectId  String?         @map("audio_object_id") @db.Uuid
   status         MediaStatus     @default(PENDING_UPLOAD)
   objectKey      String          @map("object_key")
   originalName   String          @map("original_name") @db.VarChar(255)
@@ -176,12 +264,14 @@ model MediaAsset {
   updatedAt      DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
   user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   session        PracticeSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  audioObject    AudioObject?    @relation(fields: [audioObjectId], references: [id], onDelete: SetNull)
   annotations    Annotation[]
   goalProgresses GoalProgress[]
 
   @@index([userId, sha256])
   @@index([objectKey])
   @@index([sessionId, status])
+  @@index([audioObjectId])
   @@index([expiresAt])
   @@map("media_assets")
 }

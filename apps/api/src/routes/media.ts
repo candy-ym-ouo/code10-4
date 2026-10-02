@@ -6,9 +6,23 @@ import { getConfig } from "../config/env.js";
 import { AppError, notFound } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import { enqueueProbe } from "../lib/queue.js";
-import { createPlaybackUrl, createUploadUrl, deleteObject, verifyObject } from "../lib/s3.js";
+import {
+  abortMultipartUpload,
+  createMultipartUpload,
+  createPartUploadUrl,
+  deleteObject,
+  createPlaybackUrl,
+  listUploadedParts,
+} from "../lib/s3.js";
 import { parseOrThrow } from "../lib/validation.js";
 import { audit } from "../lib/audit.js";
+import {
+  computePartPlan,
+  ensureAudioObject,
+  mediaSelect,
+  mergeAndVerifyObject,
+  recordObjectEvent,
+} from "../lib/media-object.js";
 
 const ALLOWED_MIME_TYPES = new Set([
   "audio/mpeg",
@@ -28,6 +42,7 @@ const uploadSessionSchema = z.object({
   sizeBytes: z.coerce.bigint().positive(),
   sha256: z.string().regex(/^[a-fA-F0-9]{64}$/, "SHA-256 摘要格式不正确"),
 });
+const partNumbersSchema = z.object({ partNumbers: z.array(z.coerce.number().int().min(1).max(10_000)).min(1).max(100) });
 
 function safeFileName(input: string): string {
   const base = path.basename(input).replace(/[^\p{L}\p{N}._-]+/gu, "_").slice(0, 180);
@@ -69,137 +84,443 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
       throw new AppError(413, "SESSION_SIZE_LIMIT_REACHED", `单次练习音频总量不能超过 ${config.MAX_SESSION_TOTAL_MB} MB`);
     }
 
-    const reusable = await prisma.mediaAsset.findFirst({
-      where: { userId: request.authUser!.id, sha256: input.sha256.toLowerCase(), status: "READY" },
-      orderBy: { processedAt: "desc" },
+    const digest = input.sha256.toLowerCase();
+    const partPlan = computePartPlan(Number(input.sizeBytes));
+    const now = new Date();
+    const attemptExpiresAt = new Date(now.getTime() + config.MULTIPART_TTL_HOURS * 3_600_000);
+
+    const result = await prisma.$transaction(async (tx) => {
+      const audioObject = await ensureAudioObject(tx, {
+        userId: request.authUser!.id,
+        sha256: digest,
+        sizeBytes: input.sizeBytes,
+        mimeType: input.mimeType,
+      });
+
+      // 物理对象已完成或正在处理：只新增引用，不重复占用存储。
+      // FAILED 是已成功合并但探测/校验失败的隔离对象，不能当作可信内容复用，
+      // 需要走下方重新合并上传的流程覆盖该内容寻址 Key。
+      if (["UPLOADED", "PROCESSING", "READY"].includes(audioObject.status)) {
+        const media = await tx.mediaAsset.create({
+          data: {
+            userId: request.authUser!.id,
+            sessionId,
+            audioObjectId: audioObject.id,
+            status: audioObject.status === "READY" ? "READY" : audioObject.status === "PROCESSING" ? "PROCESSING" : "UPLOADED",
+            objectKey: audioObject.objectKey,
+            originalName: safeFileName(input.originalName),
+            mimeType: input.mimeType,
+            sizeBytes: input.sizeBytes,
+            sha256: digest,
+            durationMs: audioObject.durationMs,
+            codec: audioObject.codec,
+            sampleRate: audioObject.sampleRate,
+            channels: audioObject.channels,
+            peaks: audioObject.peaks ?? undefined,
+            uploadedAt: audioObject.uploadedAt ?? now,
+            processedAt: audioObject.processedAt ?? null,
+          },
+          select: mediaSelect,
+        });
+        await recordObjectEvent(tx, {
+          action: "MEDIA_REFERENCE_CREATED",
+          result: "SUCCESS",
+          audioObjectId: audioObject.id,
+          mediaAssetId: media.id,
+          sessionId,
+          userId: request.authUser!.id,
+          objectKey: audioObject.objectKey,
+          sha256: digest,
+          detail: { sourceStatus: audioObject.status },
+        });
+        return { kind: "reused" as const, media, upload: null as null };
+      }
+
+      // 仅在事务内挑出候选会话；是否真的可续传要在事务外向 S3 确认
+      const candidate = await tx.uploadAttempt.findFirst({
+        where: { audioObjectId: audioObject.id, status: "ACTIVE" },
+        orderBy: { createdAt: "desc" },
+      });
+      return { kind: "pending" as const, audioObject, candidate };
     });
-    if (reusable) {
-      const media = await prisma.mediaAsset.create({
+
+    if (result.kind === "reused") {
+      await audit(
+        request,
+        "MEDIA_CONTENT_REUSED",
+        "MEDIA_ASSET",
+        result.media.id,
+        "SUCCESS",
+        { audioObjectId: result.media.audioObjectId },
+      );
+      return reply.status(201).send(result);
+    }
+
+    const { audioObject, candidate } = result;
+
+    // 候选会话必须在 S3 端仍然存活（ListParts 非 404）且未过期，否则作废后新建。
+    // 这样网络恢复/页面重开时只会续传真实存在的分片。
+    let attempt: { id: string; uploadId: string; partSizeBytes: bigint; partCount: number } | null = null;
+    const invalidateCandidate = async (reason: string, abortRemote: boolean): Promise<void> => {
+      if (!candidate) return;
+      await prisma.uploadAttempt
+        .update({ where: { id: candidate.id }, data: { status: "ABORTED", failureCode: reason.slice(0, 64) } })
+        .catch(() => undefined);
+      if (abortRemote) await abortMultipartUpload(audioObject.objectKey, candidate.uploadId).catch(() => undefined);
+      await recordObjectEvent(prisma, {
+        action: "MEDIA_UPLOAD_ABORTED",
+        result: "FAILURE",
+        audioObjectId: audioObject.id,
+        userId: request.authUser!.id,
+        objectKey: audioObject.objectKey,
+        sha256: digest,
+        detail: { uploadId: candidate.uploadId, reason },
+      }).catch(() => undefined);
+    };
+
+    if (candidate && candidate.expiresAt < now) {
+      await invalidateCandidate("UPLOAD_SESSION_EXPIRED", true);
+    } else if (
+      candidate &&
+      (candidate.partSizeBytes !== BigInt(partPlan.partSizeBytes) || candidate.partCount !== partPlan.partCount)
+    ) {
+      // 分片规划变化时旧分片不能再用于合并，必须中止后重建
+      await invalidateCandidate("UPLOAD_PLAN_CHANGED", true);
+    } else if (candidate) {
+      const remoteParts = await listUploadedParts(audioObject.objectKey, candidate.uploadId).catch(() => null);
+      if (remoteParts !== null) {
+        attempt = {
+          id: candidate.id,
+          uploadId: candidate.uploadId,
+          partSizeBytes: candidate.partSizeBytes,
+          partCount: candidate.partCount,
+        };
+      } else {
+        await invalidateCandidate("UPLOAD_SESSION_MISSING", false);
+      }
+    }
+
+    if (!attempt) {
+      const uploadId = await createMultipartUpload(audioObject.objectKey, input.mimeType, digest);
+      const attemptId = randomUUID();
+      await prisma.uploadAttempt.create({
+        data: {
+          id: attemptId,
+          audioObjectId: audioObject.id,
+          userId: request.authUser!.id,
+          uploadId,
+          status: "ACTIVE",
+          partSizeBytes: BigInt(partPlan.partSizeBytes),
+          partCount: partPlan.partCount,
+          parts: [],
+          expiresAt: attemptExpiresAt,
+        },
+      });
+      attempt = { id: attemptId, uploadId, partSizeBytes: BigInt(partPlan.partSizeBytes), partCount: partPlan.partCount };
+    }
+
+    const pendingResult = await prisma.$transaction(async (tx) => {
+      const media = await tx.mediaAsset.create({
         data: {
           userId: request.authUser!.id,
           sessionId,
-          status: "READY",
-          objectKey: reusable.objectKey,
-          originalName: input.originalName,
+          audioObjectId: audioObject.id,
+          status: "PENDING_UPLOAD",
+          objectKey: audioObject.objectKey,
+          originalName: safeFileName(input.originalName),
           mimeType: input.mimeType,
           sizeBytes: input.sizeBytes,
-          sha256: reusable.sha256,
-          durationMs: reusable.durationMs,
-          codec: reusable.codec,
-          sampleRate: reusable.sampleRate,
-          channels: reusable.channels,
-          peaks: reusable.peaks ?? undefined,
-          uploadedAt: new Date(),
-          processedAt: new Date(),
+          sha256: digest,
+          expiresAt: attemptExpiresAt,
         },
-        select: {
-          id: true,
-          status: true,
-          originalName: true,
-          mimeType: true,
-          sizeBytes: true,
-          durationMs: true,
-          codec: true,
-          sampleRate: true,
-          channels: true,
-          peaks: true,
-          failureCode: true,
-          failureMessage: true,
-          createdAt: true,
-        },
+        select: mediaSelect,
       });
-      return reply.status(201).send({ media, reused: true, uploadUrl: null, requiredHeaders: {}, expiresAt: null });
-    }
-
-    const mediaId = randomUUID();
-    const objectKey = `users/${request.authUser!.id}/sessions/${sessionId}/${mediaId}/${safeFileName(input.originalName)}`;
-    const uploadUrl = await createUploadUrl(objectKey, input.mimeType, input.sha256.toLowerCase());
-    const media = await prisma.mediaAsset.create({
-      data: {
-        id: mediaId,
-        userId: request.authUser!.id,
+      await recordObjectEvent(tx, {
+        action: "MEDIA_UPLOAD_INITIATED",
+        result: "SUCCESS",
+        audioObjectId: audioObject.id,
+        mediaAssetId: media.id,
         sessionId,
-        status: "PENDING_UPLOAD",
-        objectKey,
-        originalName: input.originalName,
-        mimeType: input.mimeType,
-        sizeBytes: input.sizeBytes,
-        sha256: input.sha256.toLowerCase(),
-        expiresAt: new Date(Date.now() + 24 * 60 * 60_000),
-      },
-      select: { id: true, status: true, originalName: true, sizeBytes: true, createdAt: true },
+        userId: request.authUser!.id,
+        objectKey: audioObject.objectKey,
+        sha256: digest,
+        detail: { uploadId: attempt!.uploadId, attemptId: attempt!.id, resumed: candidate?.id === attempt!.id },
+      });
+      return {
+        media,
+        reused: false,
+        upload: {
+          audioObjectId: audioObject.id,
+          uploadId: attempt!.uploadId,
+          attemptId: attempt!.id,
+          partSizeBytes: Number(attempt!.partSizeBytes),
+          partCount: attempt!.partCount,
+          expiresAt: attemptExpiresAt,
+          partUrlsEndpoint: `/api/v1/media/${media.id}/upload-parts`,
+        },
+      };
     });
 
-    return reply.status(201).send({
-      media,
-      reused: false,
-      uploadUrl,
-      requiredHeaders: {
-        "Content-Type": input.mimeType,
-        "x-amz-meta-sha256": input.sha256.toLowerCase(),
-      },
-      expiresAt: new Date(Date.now() + config.UPLOAD_URL_TTL_SECONDS * 1000),
+    await audit(
+      request,
+      "MEDIA_UPLOAD_INITIATED",
+      "MEDIA_ASSET",
+      pendingResult.media.id,
+      "SUCCESS",
+      { audioObjectId: audioObject.id, resumed: candidate?.id === attempt?.id },
+    );
+    return reply.status(201).send(pendingResult);
+  });
+
+  app.get("/media/:mediaId/upload-state", async (request) => {
+    const { mediaId } = request.params as { mediaId: string };
+    const media = await prisma.mediaAsset.findFirst({
+      where: { id: mediaId, userId: request.authUser!.id },
+      include: { audioObject: { include: { uploadAttempts: { where: { status: "ACTIVE" }, orderBy: { createdAt: "desc" }, take: 1 } } } },
     });
+    if (!media) throw notFound();
+    const attempt = media.audioObject?.uploadAttempts[0];
+    if (!attempt || attempt.expiresAt < new Date()) {
+      return { status: media.status, upload: null };
+    }
+    if (!attempt || attempt.expiresAt < new Date()) {
+      if (attempt) {
+        await prisma.uploadAttempt
+          .update({ where: { id: attempt.id }, data: { status: "ABORTED", failureCode: "UPLOAD_SESSION_EXPIRED" } })
+          .catch(() => undefined);
+      }
+      return { status: media.status, upload: null };
+    }
+    const serverParts = await listUploadedParts(media.objectKey, attempt.uploadId);
+    if (serverParts === null) {
+      // DB 记录滞后（例如已被 Worker 回收）：通知客户端重新创建上传会话
+      await prisma.uploadAttempt
+        .update({ where: { id: attempt.id }, data: { status: "ABORTED", failureCode: "UPLOAD_SESSION_MISSING" } })
+        .catch(() => undefined);
+      return { status: media.status, upload: null };
+    }
+    return {
+      status: media.status,
+      upload: {
+        audioObjectId: media.audioObjectId,
+        uploadId: attempt.uploadId,
+        attemptId: attempt.id,
+        partSizeBytes: Number(attempt.partSizeBytes),
+        partCount: attempt.partCount,
+        expiresAt: attempt.expiresAt,
+        completedParts: (serverParts ?? []).map((part) => ({ partNumber: part.partNumber, etag: part.etag, sizeBytes: part.sizeBytes })),
+      },
+    };
+  });
+
+  app.post("/media/:mediaId/upload-parts", async (request) => {
+    const { mediaId } = request.params as { mediaId: string };
+    const { partNumbers } = parseOrThrow(partNumbersSchema, request.body ?? {});
+    const media = await prisma.mediaAsset.findFirst({
+      where: { id: mediaId, userId: request.authUser!.id },
+      include: { audioObject: { include: { uploadAttempts: { where: { status: "ACTIVE" }, orderBy: { createdAt: "desc" }, take: 1 } } } },
+    });
+    if (!media) throw notFound();
+    const attempt = media.audioObject?.uploadAttempts[0];
+    if (!attempt || attempt.expiresAt < new Date()) {
+      throw new AppError(409, "UPLOAD_SESSION_EXPIRED", "分片上传会话已过期，请重新创建");
+    }
+    const uniqueParts = [...new Set(partNumbers)];
+    if (uniqueParts.some((number) => number > attempt.partCount)) {
+      throw new AppError(400, "UPLOAD_PART_INVALID", `分片编号必须在 1..${attempt.partCount} 之间`);
+    }
+    const liveParts = await listUploadedParts(media.objectKey, attempt.uploadId);
+    if (liveParts === null) {
+      await prisma.uploadAttempt
+        .update({ where: { id: attempt.id }, data: { status: "ABORTED", failureCode: "UPLOAD_SESSION_MISSING" } })
+        .catch(() => undefined);
+      throw new AppError(409, "UPLOAD_SESSION_MISSING", "分片上传会话不存在，请重新创建上传");
+    }
+    const urls: Array<{ partNumber: number; url: string }> = [];
+    for (const partNumber of uniqueParts) {
+      urls.push({ partNumber, url: await createPartUploadUrl(media.objectKey, attempt.uploadId, partNumber) });
+    }
+    return {
+      uploadId: attempt.uploadId,
+      partSizeBytes: Number(attempt.partSizeBytes),
+      partCount: attempt.partCount,
+      urls,
+    };
   });
 
   app.post("/media/:mediaId/complete-upload", async (request) => {
     const { mediaId } = request.params as { mediaId: string };
-    const media = await prisma.mediaAsset.findFirst({ where: { id: mediaId, userId: request.authUser!.id } });
+    const media = await prisma.mediaAsset.findFirst({
+      where: { id: mediaId, userId: request.authUser!.id },
+      include: { audioObject: { include: { uploadAttempts: { where: { status: "ACTIVE" }, orderBy: { createdAt: "desc" }, take: 1 } } } },
+    });
     if (!media) throw notFound();
-    if (media.status === "READY") return { media };
-    if (!["PENDING_UPLOAD", "UPLOADING", "UPLOADED"].includes(media.status)) {
+    if (media.status === "READY") return { media, reused: true, probeQueued: false };
+    if (!["PENDING_UPLOAD", "UPLOADING", "UPLOADED", "FAILED"].includes(media.status)) {
       throw new AppError(409, "INVALID_MEDIA_STATE", "当前音频状态不能确认上传");
     }
-    if (media.expiresAt && media.expiresAt < new Date()) {
-      await prisma.mediaAsset.update({ where: { id: media.id }, data: { status: "FAILED", failureCode: "UPLOAD_SESSION_EXPIRED" } });
+    if (!media.audioObject || !media.audioObject.uploadAttempts[0]) {
+      throw new AppError(409, "UPLOAD_SESSION_MISSING", "上传会话不存在，请重新创建上传");
+    }
+    const attempt = media.audioObject.uploadAttempts[0];
+    if (attempt.expiresAt < new Date()) {
+      await prisma.uploadAttempt.update({
+        where: { id: attempt.id },
+        data: { status: "ABORTED", failureCode: "UPLOAD_SESSION_EXPIRED" },
+      });
       throw new AppError(409, "UPLOAD_SESSION_EXPIRED", "上传会话已过期，请重新创建");
     }
 
-    await verifyObject(media.objectKey, media.sizeBytes, media.sha256);
-    const updated = await prisma.mediaAsset.update({
-      where: { id: media.id },
-      data: {
-        status: "UPLOADED",
-        uploadedAt: new Date(),
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60_000),
-        failureCode: null,
-        failureMessage: null,
-      },
-    });
-    try {
-      await enqueueProbe(media.id);
-    } catch {
-      throw new AppError(503, "PROCESSING_UNAVAILABLE", "文件已上传，但音频解析服务暂不可用，可稍后重试");
+    // 同摘要并发确认：数据库唯一约束保证只有一个物理对象；
+    // 若另一请求已完成合并/探测，本次确认直接复用结果，不再触碰对象存储。
+    const currentObject = await prisma.audioObject.findUniqueOrThrow({ where: { id: media.audioObject.id } });
+    if (currentObject.status === "READY") {
+      const updated = await prisma.mediaAsset.update({
+        where: { id: media.id },
+        data: {
+          status: "READY",
+          durationMs: currentObject.durationMs,
+          codec: currentObject.codec,
+          sampleRate: currentObject.sampleRate,
+          channels: currentObject.channels,
+          peaks: currentObject.peaks ?? undefined,
+          uploadedAt: currentObject.uploadedAt ?? undefined,
+          processedAt: currentObject.processedAt ?? undefined,
+        },
+        select: mediaSelect,
+      });
+      return { media: updated, reused: true, probeQueued: false };
     }
-    await audit(request, "MEDIA_UPLOADED", "MEDIA_ASSET", media.id, "SUCCESS");
-    return { media: updated, probeQueued: true };
+    if (currentObject.status === "UPLOADED" || currentObject.status === "PROCESSING") {
+      await prisma.mediaAsset.update({ where: { id: media.id }, data: { status: currentObject.status } });
+      throw new AppError(409, "MEDIA_FINALIZING", "另一请求正在确认相同内容，请稍后查询状态");
+    }
+
+    // 仅一个确认者走到这里：合并分片 + 服务端全量 SHA-256 校验
+    const claimed = await prisma.audioObject.updateMany({
+      where: { id: currentObject.id, status: { in: ["UPLOADING", "FAILED"] } },
+      data: { status: "PROCESSING" },
+    });
+    if (claimed.count === 0) {
+      throw new AppError(409, "MEDIA_FINALIZING", "另一请求正在确认相同内容，请稍后查询状态");
+    }
+
+    const partSizeBytes = Number(attempt.partSizeBytes);
+    let mergedParts: Array<{ partNumber: number; etag: string }>;
+    try {
+      mergedParts = await mergeAndVerifyObject({
+        objectKey: media.objectKey,
+        uploadId: attempt.uploadId,
+        partCount: attempt.partCount,
+        partSizeBytes,
+        sizeBytes: media.sizeBytes,
+        sha256: media.sha256,
+      });
+    } catch (error) {
+      if (error instanceof AppError && error.code === "UPLOAD_PARTS_INCOMPLETE") {
+        // 缺片：对象仍等待补齐分片，回到 UPLOADING
+        await prisma.audioObject.update({ where: { id: currentObject.id }, data: { status: "UPLOADING" } });
+        throw error;
+      }
+      if (error instanceof AppError && error.code === "UPLOAD_SESSION_MISSING") {
+        // S3 会话已不存在：作废记录，客户端重新发起上传时会创建新会话
+        await prisma.$transaction(async (tx) => {
+          await tx.audioObject.update({ where: { id: currentObject.id }, data: { status: "UPLOADING" } });
+          await tx.uploadAttempt.updateMany({
+            where: { audioObjectId: currentObject.id, status: "ACTIVE" },
+            data: { status: "ABORTED", failureCode: "UPLOAD_SESSION_MISSING" },
+          });
+        });
+        throw error;
+      }
+      if (error instanceof AppError && error.code === "UPLOAD_HASH_MISMATCH") {
+        // 摘要不匹配：物理对象内容不可信，标记 FAILED 隔离；需要重新发起上传覆盖该内容寻址 Key
+        await prisma.$transaction(async (tx) => {
+          await tx.audioObject.update({
+            where: { id: currentObject.id },
+            data: { status: "FAILED", failureCode: "UPLOAD_HASH_MISMATCH", failureMessage: "合并后摘要不一致" },
+          });
+          await tx.uploadAttempt.update({
+            where: { id: attempt.id },
+            data: { status: "FAILED", failureCode: "UPLOAD_HASH_MISMATCH", failureMessage: "合并后摘要不一致" },
+          });
+          await tx.mediaAsset.updateMany({
+            where: { audioObjectId: currentObject.id, status: { in: ["PENDING_UPLOAD", "UPLOADING"] } },
+            data: { status: "FAILED", failureCode: "UPLOAD_HASH_MISMATCH", failureMessage: "合并后摘要不一致，请重新上传" },
+          });
+          await recordObjectEvent(tx, {
+            action: "MEDIA_UPLOAD_VERIFY_FAILED",
+            result: "FAILURE",
+            audioObjectId: currentObject.id,
+            mediaAssetId: media.id,
+            sessionId: media.sessionId,
+            userId: media.userId,
+            objectKey: media.objectKey,
+            sha256: media.sha256,
+            detail: { code: error.code },
+          });
+        });
+        throw error;
+      }
+      await prisma.audioObject.update({ where: { id: currentObject.id }, data: { status: "UPLOADING" } });
+      throw error;
+    }
+
+    const updatedMedia = await prisma.$transaction(async (tx) => {
+      const now = new Date();
+      await tx.audioObject.update({
+        where: { id: currentObject.id },
+        data: { status: "UPLOADED", uploadedAt: now, failureCode: null, failureMessage: null },
+      });
+      await tx.uploadAttempt.update({
+        where: { id: attempt.id },
+        data: {
+          status: "COMPLETED",
+          completedAt: now,
+          parts: mergedParts as never,
+          failureCode: null,
+          failureMessage: null,
+        },
+      });
+      const updated = await tx.mediaAsset.update({
+        where: { id: media.id },
+        data: { status: "UPLOADED", uploadedAt: now, failureCode: null, failureMessage: null },
+        select: mediaSelect,
+      });
+      // 同一物理对象的其他待确认引用一并转为 UPLOADED
+      await tx.mediaAsset.updateMany({
+        where: { audioObjectId: currentObject.id, status: { in: ["PENDING_UPLOAD", "UPLOADING", "FAILED"] } },
+        data: { status: "UPLOADED", uploadedAt: now },
+      });
+      await recordObjectEvent(tx, {
+        action: "MEDIA_UPLOAD_CONFIRMED",
+        result: "SUCCESS",
+        audioObjectId: currentObject.id,
+        mediaAssetId: media.id,
+        sessionId: media.sessionId,
+        userId: media.userId,
+        objectKey: media.objectKey,
+        sha256: media.sha256,
+        detail: { partCount: mergedParts.length, partSizeBytes },
+      });
+      return updated;
+    });
+
+    // 对象已确认，队列短暂不可用时不回滚：媒体保持 UPLOADED，
+    // 前端轮询期间可通过 retry-probe 重新投递，Worker 侧按对象幂等。
+    let probeQueued = true;
+    try {
+      await enqueueProbe(currentObject.id);
+    } catch {
+      probeQueued = false;
+    }
+    await audit(request, "MEDIA_UPLOADED", "MEDIA_ASSET", media.id, "SUCCESS", { audioObjectId: currentObject.id, probeQueued });
+    return { media: updatedMedia, reused: false, probeQueued };
   });
 
   app.get("/media/:mediaId", async (request) => {
     const { mediaId } = request.params as { mediaId: string };
-    const media = await prisma.mediaAsset.findFirst({
-      where: { id: mediaId, userId: request.authUser!.id },
-      select: {
-        id: true,
-        sessionId: true,
-        status: true,
-        originalName: true,
-        mimeType: true,
-        sizeBytes: true,
-        sha256: true,
-        durationMs: true,
-        codec: true,
-        sampleRate: true,
-        channels: true,
-        peaks: true,
-        failureCode: true,
-        failureMessage: true,
-        uploadedAt: true,
-        processedAt: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
+    const media = await prisma.mediaAsset.findFirst({ where: { id: mediaId, userId: request.authUser!.id }, select: mediaSelect });
     if (!media) throw notFound();
     return { media };
   });
@@ -215,8 +536,27 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
 
   app.post("/media/:mediaId/retry-probe", async (request) => {
     const { mediaId } = request.params as { mediaId: string };
-    const media = await prisma.mediaAsset.findFirst({ where: { id: mediaId, userId: request.authUser!.id } });
+    const media = await prisma.mediaAsset.findFirst({
+      where: { id: mediaId, userId: request.authUser!.id },
+      include: { audioObject: true },
+    });
     if (!media) throw notFound();
+    if (media.audioObject) {
+      if (!["FAILED", "UPLOADED"].includes(media.audioObject.status)) {
+        throw new AppError(409, "INVALID_MEDIA_STATE", "当前音频不需要重试解析");
+      }
+      await prisma.audioObject.update({
+        where: { id: media.audioObject.id },
+        data: { status: "UPLOADED", failureCode: null, failureMessage: null },
+      });
+      await prisma.mediaAsset.updateMany({
+        where: { audioObjectId: media.audioObject.id, status: "FAILED" },
+        data: { status: "UPLOADED", failureCode: null, failureMessage: null },
+      });
+      await enqueueProbe(media.audioObject.id);
+      return { success: true, status: "UPLOADED" };
+    }
+    // 兼容回填前的历史数据
     if (!["FAILED", "UPLOADED"].includes(media.status)) {
       throw new AppError(409, "INVALID_MEDIA_STATE", "当前音频不需要重试解析");
     }
@@ -224,7 +564,7 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
       where: { id: media.id },
       data: { status: "UPLOADED", failureCode: null, failureMessage: null },
     });
-    await enqueueProbe(media.id);
+    await enqueueProbe(media.id, { legacyMediaId: media.id });
     return { success: true, status: "UPLOADED" };
   });
 
@@ -232,11 +572,103 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
     const { mediaId } = request.params as { mediaId: string };
     const media = await prisma.mediaAsset.findFirst({ where: { id: mediaId, userId: request.authUser!.id } });
     if (!media) throw notFound();
+
+    // 引用清理：只有最后一个引用被移除时才真正删除物理对象，全程写事件链。
+    // 对象存储删除失败时保留媒体引用与对象行，事件链记录失败，客户端可重试。
     const referenceCount = await prisma.mediaAsset.count({ where: { objectKey: media.objectKey } });
-    if (referenceCount === 1) await deleteObject(media.objectKey);
-    await prisma.mediaAsset.delete({ where: { id: media.id } });
-    await audit(request, "MEDIA_DELETED", "MEDIA_ASSET", media.id, "SUCCESS");
-    return { success: true };
+    if (referenceCount === 1) {
+      const activeAttempts = media.audioObjectId
+        ? await prisma.uploadAttempt.findMany({
+            where: { audioObjectId: media.audioObjectId, status: "ACTIVE" },
+          })
+        : [];
+      for (const attempt of activeAttempts) {
+        await abortMultipartUpload(media.objectKey, attempt.uploadId).catch(() => undefined);
+        await prisma.uploadAttempt.update({
+          where: { id: attempt.id },
+          data: { status: "ABORTED", failureCode: "REFERENCE_DELETED" },
+        });
+      }
+      try {
+        await deleteObject(media.objectKey);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "OBJECT_DELETE_FAILED";
+        await recordObjectEvent(prisma, {
+          action: "MEDIA_OBJECT_DELETE_FAILED",
+          result: "FAILURE",
+          audioObjectId: media.audioObjectId,
+          mediaAssetId: media.id,
+          sessionId: media.sessionId,
+          userId: media.userId,
+          objectKey: media.objectKey,
+          sha256: media.sha256,
+          detail: { referenceCountBefore: referenceCount, error: message },
+        }).catch(() => undefined);
+        await audit(request, "MEDIA_DELETE_FAILED", "MEDIA_ASSET", media.id, "FAILURE", { objectKey: media.objectKey });
+        throw new AppError(500, "OBJECT_DELETE_FAILED", "物理对象删除失败，引用已保留，请稍后重试");
+      }
+
+      await prisma.$transaction(async (tx) => {
+        await tx.mediaAsset.delete({ where: { id: media.id } });
+        if (media.audioObjectId) {
+          await tx.uploadAttempt.deleteMany({ where: { audioObjectId: media.audioObjectId } });
+          await tx.audioObject.delete({ where: { id: media.audioObjectId } });
+        }
+        await recordObjectEvent(tx, {
+          action: "MEDIA_OBJECT_DELETED",
+          result: "SUCCESS",
+          audioObjectId: media.audioObjectId,
+          mediaAssetId: media.id,
+          sessionId: media.sessionId,
+          userId: media.userId,
+          objectKey: media.objectKey,
+          sha256: media.sha256,
+          detail: { referenceCountBefore: referenceCount, objectDeleted: true },
+        });
+      });
+      await audit(request, "MEDIA_DELETED", "MEDIA_ASSET", media.id, "SUCCESS", { objectDeleted: true, referenceCount });
+      return { success: true, objectDeleted: true, referenceCountAfter: 0 };
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.mediaAsset.delete({ where: { id: media.id } });
+      await recordObjectEvent(tx, {
+        action: "MEDIA_REFERENCE_REMOVED",
+        result: "SUCCESS",
+        audioObjectId: media.audioObjectId,
+        mediaAssetId: media.id,
+        sessionId: media.sessionId,
+        userId: media.userId,
+        objectKey: media.objectKey,
+        sha256: media.sha256,
+        detail: { referenceCountBefore: referenceCount, objectDeleted: false },
+      });
+    });
+    await audit(request, "MEDIA_DELETED", "MEDIA_ASSET", media.id, "SUCCESS", { objectDeleted: false, referenceCount });
+    return { success: true, objectDeleted: false, referenceCountAfter: referenceCount - 1 };
+  });
+
+  // 引用清理追溯：查看某条音频背后的物理对象及完整引用事件链
+  app.get("/media/:mediaId/object-history", async (request) => {
+    const { mediaId } = request.params as { mediaId: string };
+    const media = await prisma.mediaAsset.findFirst({ where: { id: mediaId, userId: request.authUser!.id } });
+    if (!media) throw notFound();
+    const [events, referenceCount, object] = await Promise.all([
+      prisma.mediaObjectEvent.findMany({
+        where: {
+          OR: [
+            { mediaAssetId: mediaId },
+            ...(media.audioObjectId ? [{ audioObjectId: media.audioObjectId }] : []),
+            { objectKey: media.objectKey },
+          ],
+        },
+        orderBy: { createdAt: "desc" },
+        take: 100,
+      }),
+      prisma.mediaAsset.count({ where: { objectKey: media.objectKey } }),
+      media.audioObjectId ? prisma.audioObject.findUnique({ where: { id: media.audioObjectId } }) : Promise.resolve(null),
+    ]);
+    return { object, referenceCount, events };
   });
 };
 

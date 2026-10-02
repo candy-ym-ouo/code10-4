@@ -65,14 +65,24 @@ Refresh Cookie 路径为 `/api/v1/auth`，生产环境在 HTTPS 下自动使用 
 
 ## 音频上传
 
+音频采用 **S3 Multipart Upload 分片直传**，支持断点重试与内容复用：
+
+- 物理对象按 `用户 + SHA-256` 内容寻址（`audio_objects` 唯一约束），同一用户重复上传相同内容只生成一个物理对象，练习只持有引用。
+- 网络恢复后客户端调用 `upload-state` 获取服务端已存在的分片清单，**只续传缺失分片**，已传分片不重发。
+- 同摘要并发确认由数据库状态串行化：只有一个请求执行 `CompleteMultipartUpload` 与 SHA-256 校验，其他请求返回 `MEDIA_FINALIZING`，轮询即可拿到同一对象。
+- 对象的引用创建、确认、复用、删除与删除失败全部写入 `media_object_events`，可通过对象历史接口追溯。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/sessions/:sessionId/media/uploads` | 创建上传会话并返回预签名 PUT URL |
-| POST | `/media/:mediaId/complete-upload` | 校验对象大小/SHA-256 并投递探测任务 |
+| POST | `/sessions/:sessionId/media/uploads` | 创建上传会话；内容已存在时返回 `reused: true`，否则返回分片描述符 |
+| GET | `/media/:mediaId/upload-state` | 查询分片会话与服务端已完成分片（断点恢复入口） |
+| POST | `/media/:mediaId/upload-parts` | 批量获取分片预签名 PUT URL |
+| POST | `/media/:mediaId/complete-upload` | 校验分片连续性，合并对象并做大小/SHA-256 全量校验，然后投递探测任务 |
 | GET | `/media/:mediaId` | 状态、元数据与波形峰值 |
 | GET | `/media/:mediaId/playback-url` | 获取短期私有播放地址 |
-| POST | `/media/:mediaId/retry-probe` | 重试音频探测 |
-| DELETE | `/media/:mediaId` | 删除对象和关联标记 |
+| POST | `/media/:mediaId/retry-probe` | 重试音频探测（按物理对象去重） |
+| DELETE | `/media/:mediaId` | 删除引用；最后一个引用移除时才删除物理对象 |
+| GET | `/media/:mediaId/object-history` | 物理对象信息、当前引用数与引用事件链 |
 
 创建上传会话：
 
@@ -85,7 +95,40 @@ Refresh Cookie 路径为 `/api/v1/auth`，生产环境在 HTTPS 下自动使用 
 }
 ```
 
-预签名请求的 `Content-Type` 和 `x-amz-meta-sha256` 已纳入签名，必须使用返回的 `requiredHeaders` 原样上传。
+内容已存在时：
+
+```json
+{
+  "media": { "id": "…", "status": "READY" },
+  "reused": true,
+  "upload": null
+}
+```
+
+需要上传时返回分片描述符：
+
+```json
+{
+  "media": { "id": "…", "status": "PENDING_UPLOAD" },
+  "reused": false,
+  "upload": {
+    "audioObjectId": "uuid",
+    "uploadId": "S3 multipart upload id",
+    "attemptId": "uuid",
+    "partSizeBytes": 8388608,
+    "partCount": 3,
+    "expiresAt": "2026-10-03T00:00:00.000Z"
+  }
+}
+```
+
+`upload-state` 返回的 `completedParts` 以对象存储服务端 `ListParts` 为准，包含每片的编号、大小与 ETag。确认上传时服务端重新列举分片并校验：
+
+- 分片必须 `1..partCount` 连续，除最后一片外每片大小必须等于 `partSizeBytes`；
+- 缺片时返回 `409 UPLOAD_PARTS_INCOMPLETE`，客户端续传缺失分片后重新确认；
+- 合并后服务端流式重算整个对象的 SHA-256，与声明不符返回 `UPLOAD_HASH_MISMATCH`。
+
+分片 PUT 不使用自定义请求头；`Content-Type` 与 `x-amz-meta-sha256` 在 `CreateMultipartUpload` 时已设置。未完成的分片会话由 Worker 按 `MULTIPART_TTL_HOURS`（默认 24 小时）定期中止回收。
 
 ## 标记
 
