@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { createSHA256 } from "hash-wasm";
 import WaveformPlayer, { type WaveAnnotation } from "../components/WaveformPlayer.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { apiFetch, ApiError } from "../api/client.js";
 import { annotationLabels, formatBytes, formatTimeMs, parseTimeInput } from "../utils/format.js";
+import { createUploader, type UploadItem } from "../utils/uploader.js";
 
 type AnnotationType = "RHYTHM" | "FINGERING" | "EMOTION";
 interface Media {
@@ -27,9 +27,6 @@ interface Session {
   id: string; title: string; instrument: string; status: string; version: number; actualDurationMs: number | string;
   startedAt: string; mediaAssets: Media[]; annotations: Annotation[]; goals: Goal[]; review: Review | null;
 }
-interface UploadItem {
-  id: string; file: File; status: string; progress: number; mediaId?: string; error?: string;
-}
 interface NewGoal {
   key: string; title: string; category: string; metricType: string; baselineValue: string; targetValue: string; unit: string; dueDate: string;
   method: string; evidenceRequirement: string; annotationId: string;
@@ -47,7 +44,8 @@ const selectedAnnotationId = ref<string | null>(null);
 const playbackUrl = ref<string | null>(null);
 const playheadMs = ref(0);
 const waveform = ref<InstanceType<typeof WaveformPlayer> | null>(null);
-const uploads = ref<UploadItem[]>([]);
+const uploader = createUploader(String(route.params.id));
+const uploads = uploader.uploads;
 const dragging = ref(false);
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -82,7 +80,7 @@ const waveAnnotations = computed<WaveAnnotation[]>(() =>
 );
 const openGoals = computed(() => session.value?.goals.filter((goal) => ["OPEN", "IN_PROGRESS"].includes(goal.status)) ?? []);
 const readyMedia = computed(() => session.value?.mediaAssets.filter((media) => media.status === "READY") ?? []);
-const activeUploads = computed(() => uploads.value.filter((item) => !["READY", "FAILED", "CANCELLED"].includes(item.status)));
+const activeUploads = computed(() => uploads.filter((item) => !["READY", "FAILED", "CANCELLED"].includes(item.status)));
 const startMs = computed(() => parseTimeInput(annotationForm.startText) ?? 0);
 const endMs = computed(() => parseTimeInput(annotationForm.endText) ?? 0);
 
@@ -182,103 +180,54 @@ async function deleteAnnotation(): Promise<void> {
   resetAnnotationForm();
 }
 
-function mediaType(file: File): string {
-  if (file.type.startsWith("audio/")) return file.type;
-  const extension = file.name.split(".").pop()?.toLowerCase();
-  return ({ mp3: "audio/mpeg", m4a: "audio/mp4", wav: "audio/wav", ogg: "audio/ogg", flac: "audio/flac", webm: "audio/webm" } as Record<string, string>)[extension ?? ""] ?? "audio/mpeg";
-}
-
-async function sha256(file: File): Promise<string> {
-  const hasher = await createSHA256();
-  hasher.init();
-  const chunkSize = 4 * 1024 * 1024;
-  for (let offset = 0; offset < file.size; offset += chunkSize) {
-    const chunk = new Uint8Array(await file.slice(offset, offset + chunkSize).arrayBuffer());
-    hasher.update(chunk);
-  }
-  return hasher.digest("hex");
-}
-
-function uploadPut(url: string, file: File, mimeType: string, digest: string, onProgress: (value: number) => void): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    request.open("PUT", url);
-    request.setRequestHeader("Content-Type", mimeType);
-    request.setRequestHeader("x-amz-meta-sha256", digest);
-    request.upload.onprogress = (event) => {
-      if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
-    };
-    request.onload = () => request.status >= 200 && request.status < 300 ? resolve() : reject(new Error(`对象存储返回 ${request.status}`));
-    request.onerror = () => reject(new Error("上传连接中断"));
-    request.ontimeout = () => reject(new Error("上传超时"));
-    request.send(file);
-  });
-}
-
-async function pollMedia(upload: UploadItem): Promise<void> {
+async function pollMedia(item: UploadItem): Promise<void> {
   for (let attempt = 0; attempt < 150; attempt += 1) {
-    const result = await apiFetch<{ media: Media }>(`/api/v1/media/${upload.mediaId}`);
+    const result = await apiFetch<{ media: Media }>(`/api/v1/media/${item.mediaId}`);
     const existing = session.value!.mediaAssets.findIndex((media) => media.id === result.media.id);
     if (existing >= 0) session.value!.mediaAssets[existing] = result.media;
     else session.value!.mediaAssets.push(result.media);
     if (result.media.status === "READY") {
-      upload.status = "READY";
-      upload.progress = 100;
+      item.status = "READY";
+      item.progress = 100;
       await selectMedia(result.media.id);
       return;
     }
     if (result.media.status === "FAILED") {
-      upload.status = "FAILED";
-      upload.error = result.media.failureMessage ?? "音频解析失败";
+      item.status = "FAILED";
+      item.error = result.media.failureMessage ?? "音频解析失败";
       return;
     }
-    upload.status = "等待系统校验";
+    item.status = "等待系统校验";
     await new Promise((resolve) => setTimeout(resolve, 2000));
   }
-  upload.status = "FAILED";
-  upload.error = "音频解析超时，可点击重试";
+  item.status = "FAILED";
+  item.error = "音频解析超时，可点击重试";
 }
 
-async function uploadFiles(files: FileList | File[]): Promise<void> {
-  for (const file of Array.from(files)) {
-    const item = reactive<UploadItem>({ id: `${Date.now()}-${file.name}`, file, status: "计算摘要", progress: 0 });
-    uploads.value.push(item);
-    try {
-      const digest = await sha256(file);
-      const mimeType = mediaType(file);
-      const creation = await apiFetch<{ media: { id: string }; reused: boolean; uploadUrl: string | null; requiredHeaders: Record<string, string> }>(
-        `/api/v1/sessions/${session.value!.id}/media/uploads`,
-        { method: "POST", body: JSON.stringify({ originalName: file.name, mimeType, sizeBytes: file.size, sha256: digest }) },
-      );
-      item.mediaId = creation.media.id;
-      if (creation.reused) {
-        item.status = "READY";
-        item.progress = 100;
-        const reused = await apiFetch<{ media: Media }>(`/api/v1/media/${creation.media.id}`);
-        session.value!.mediaAssets.push(reused.media);
-        await selectMedia(reused.media.id);
-        continue;
-      }
-      item.status = "上传中";
-      await uploadPut(creation.uploadUrl!, file, mimeType, digest, (progress) => { item.progress = progress; });
-      item.status = "等待系统校验";
-      await apiFetch(`/api/v1/media/${creation.media.id}/complete-upload`, { method: "POST", body: "{}" });
-      await pollMedia(item);
-    } catch (reason) {
-      item.status = "FAILED";
-      item.error = reason instanceof ApiError ? reason.message : reason instanceof Error ? reason.message : "上传失败";
-    }
+function handleUploadReady(item: UploadItem, mediaId: string, reused: boolean): void {
+  item.mediaId = mediaId;
+  if (reused) {
+    item.status = "READY";
+    void apiFetch<{ media: Media }>(`/api/v1/media/${mediaId}`).then(({ media }) => {
+      if (!session.value!.mediaAssets.some((item) => item.id === media.id)) session.value!.mediaAssets.push(media);
+      void selectMedia(media.id);
+    });
+    return;
   }
+  void pollMedia(item);
 }
 
-async function retryUpload(item: UploadItem): Promise<void> {
-  uploads.value = uploads.value.filter((upload) => upload.id !== item.id);
-  await uploadFiles([item.file]);
+function uploadFiles(files: FileList | File[]): void {
+  uploader.addFiles(files, { onReady: handleUploadReady });
+}
+
+function retryUpload(item: UploadItem): void {
+  uploader.retry(item, { onReady: handleUploadReady });
 }
 
 function onDrop(event: DragEvent): void {
   dragging.value = false;
-  if (event.dataTransfer?.files.length) void uploadFiles(event.dataTransfer.files);
+  if (event.dataTransfer?.files.length) uploadFiles(event.dataTransfer.files);
 }
 
 async function saveReview(): Promise<void> {
@@ -429,9 +378,18 @@ onMounted(loadSession);
           </div>
 
           <div v-for="item in uploads" :key="item.id" class="upload-item">
-            <div class="row between"><strong>{{ item.file.name }}</strong><small>{{ item.status }}</small></div>
+            <div class="row between">
+              <strong>{{ item.file.name }}</strong>
+              <small>{{ item.status === "上传中" ? `上传中 · 已传分片 ${item.uploadedParts.size}` : item.status }}</small>
+            </div>
             <div class="progress-bar"><span :style="{ width: `${item.progress}%` }" /></div>
-            <div v-if="item.error" class="row between"><small class="danger-text">{{ item.error }}</small><button class="button small ghost" @click="retryUpload(item)">重试</button></div>
+            <div v-if="item.error" class="row between">
+              <small class="danger-text">{{ item.error }}</small>
+              <span class="row">
+                <button v-if="!['READY', 'CANCELLED'].includes(item.status)" class="button small ghost" type="button" @click="uploader.abort(item)">取消</button>
+                <button class="button small ghost" type="button" @click="retryUpload(item)">断点续传</button>
+              </span>
+            </div>
           </div>
         </aside>
 

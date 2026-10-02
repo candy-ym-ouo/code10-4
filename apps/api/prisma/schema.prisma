@@ -22,6 +22,13 @@ enum SessionStatus {
   DELETE_FAILED
 }
 
+enum MediaObjectStatus {
+  UPLOADED
+  PROCESSING
+  READY
+  FAILED
+}
+
 enum MediaStatus {
   PENDING_UPLOAD
   UPLOADING
@@ -95,6 +102,7 @@ model User {
   refreshSessions   RefreshSession[]
   practiceSessions  PracticeSession[]
   mediaAssets       MediaAsset[]
+  mediaObjects      MediaObject[]
   annotations       Annotation[]
   goals             Goal[]
   goalProgresses    GoalProgress[]
@@ -152,12 +160,42 @@ model PracticeSession {
   @@map("practice_sessions")
 }
 
+model MediaObject {
+  id            String            @id @default(uuid()) @db.Uuid
+  userId        String            @map("user_id") @db.Uuid
+  objectKey     String            @unique @map("object_key") @db.Text
+  sha256        String            @db.Char(64)
+  status        MediaObjectStatus @default(UPLOADED)
+  sizeBytes     BigInt            @map("size_bytes")
+  mimeType      String            @map("mime_type") @db.VarChar(100)
+  durationMs    BigInt?           @map("duration_ms")
+  codec         String?           @db.VarChar(64)
+  sampleRate    Int?              @map("sample_rate")
+  channels      Int?              @db.SmallInt
+  peaks         Json?
+  failureCode   String?           @map("failure_code") @db.VarChar(64)
+  failureMessage String?          @map("failure_message") @db.VarChar(500)
+  uploadedAt    DateTime?         @map("uploaded_at") @db.Timestamptz(6)
+  processedAt   DateTime?         @map("processed_at") @db.Timestamptz(6)
+  createdAt     DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime          @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user          User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assets        MediaAsset[]
+
+  @@unique([userId, sha256], name: "media_objects_user_sha256_key")
+  @@index([userId, status])
+  @@map("media_objects")
+}
+
 model MediaAsset {
   id             String          @id @default(uuid()) @db.Uuid
   userId         String          @map("user_id") @db.Uuid
   sessionId      String          @map("session_id") @db.Uuid
+  objectId       String?         @map("object_id") @db.Uuid
   status         MediaStatus     @default(PENDING_UPLOAD)
   objectKey      String          @map("object_key")
+  uploadId       String?         @map("upload_id") @db.VarChar(256)
+  uploadPartSize Int?            @map("upload_part_size")
   originalName   String          @map("original_name") @db.VarChar(255)
   mimeType       String          @map("mime_type") @db.VarChar(100)
   sizeBytes      BigInt          @map("size_bytes")
@@ -176,11 +214,13 @@ model MediaAsset {
   updatedAt      DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
   user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   session        PracticeSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  object         MediaObject?    @relation(fields: [objectId], references: [id], onDelete: Restrict)
   annotations    Annotation[]
   goalProgresses GoalProgress[]
 
   @@index([userId, sha256])
   @@index([objectKey])
+  @@index([objectId])
   @@index([sessionId, status])
   @@index([expiresAt])
   @@map("media_assets")

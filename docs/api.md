@@ -63,16 +63,19 @@ Refresh Cookie 路径为 `/api/v1/auth`，生产环境在 HTTPS 下自动使用 
 }
 ```
 
-## 音频上传
+## 音频上传（分片断点续传 + 内容复用）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/sessions/:sessionId/media/uploads` | 创建上传会话并返回预签名 PUT URL |
-| POST | `/media/:mediaId/complete-upload` | 校验对象大小/SHA-256 并投递探测任务 |
+| POST | `/sessions/:sessionId/media/uploads` | 初始化分片上传；同摘要已有就绪物理对象时直接复用 |
+| GET | `/media/:mediaId/upload-state` | 查询服务端已收到的分片（ListParts），用于断点恢复 |
+| GET | `/media/:mediaId/upload-parts?partNumbers=1,3` | 为指定分片批量签发预签名 PUT URL |
+| POST | `/media/:mediaId/complete-upload` | 核对分片、合并对象、校验大小/SHA-256 并投递探测任务 |
+| POST | `/media/:mediaId/abort-upload` | 放弃上传并中止 S3 分片会话 |
 | GET | `/media/:mediaId` | 状态、元数据与波形峰值 |
 | GET | `/media/:mediaId/playback-url` | 获取短期私有播放地址 |
 | POST | `/media/:mediaId/retry-probe` | 重试音频探测 |
-| DELETE | `/media/:mediaId` | 删除对象和关联标记 |
+| DELETE | `/media/:mediaId` | 删除引用；最后一个引用删除时回收物理对象 |
 
 创建上传会话：
 
@@ -81,11 +84,29 @@ Refresh Cookie 路径为 `/api/v1/auth`，生产环境在 HTTPS 下自动使用 
   "originalName": "practice.wav",
   "mimeType": "audio/wav",
   "sizeBytes": 2646000,
-  "sha256": "64-hex-characters"
+  "sha256": "64-hex-characters",
+  "partSize": 8388608
 }
 ```
 
-预签名请求的 `Content-Type` 和 `x-amz-meta-sha256` 已纳入签名，必须使用返回的 `requiredHeaders` 原样上传。
+`partSize` 可选（最小 5 MiB，默认 8 MiB）。响应中 `upload.parts` 是每片的
+`{partNumber,start,end}` 字节区间，`partUrls` 为首批预签名 PUT 地址，
+`upload.uploadedPartNumbers` 是对象存储端已确认存在的分片。
+
+断点与复用语义：
+
+1. 网络中断后重试，客户端先调 `upload-state`，仅对缺失分片重新签名并续传，
+   已传分片不重复上传；确认时服务端再次以 ListParts 为准核对，
+   缺片返回 `409 UPLOAD_PARTS_MISSING` 并在 `details.missingParts` 给出序号。
+2. 同一用户相同 SHA-256 的物理对象只保留一份：初始化时若已有 `READY` 对象，
+   响应 `reused=true` 且 `upload=null`，零网络传输直接建立引用。
+3. 同摘要的并发确认由服务端事务 + advisory lock 串行化，只有第一个确认者
+   合并并校验对象，其余确认只创建引用；探测（ffprobe/波形）只执行一次，
+   结果同步到全部引用。
+4. 删除引用时引用计数以 `media_objects` 为准：仍有其它练习引用则只解除关联，
+   最后一个引用删除才回收 S3 内容。每次引用变更与物理对象回收均写审计日志
+   （`MEDIA_REFERENCE_REMOVED` / `MEDIA_OBJECT_DELETED` /
+   `MEDIA_OBJECT_GARBAGE_COLLECTED`），引用清理可追溯。
 
 ## 标记
 

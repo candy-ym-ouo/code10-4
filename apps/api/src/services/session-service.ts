@@ -15,6 +15,7 @@ export const sessionInclude = {
     orderBy: { createdAt: "asc" },
     select: {
       id: true,
+      objectId: true,
       status: true,
       originalName: true,
       mimeType: true,

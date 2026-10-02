@@ -17,6 +17,12 @@ export const MEDIA_STATUSES = [
   "FAILED",
   "CANCELLED",
 ] as const;
+export const MEDIA_OBJECT_STATUSES = ["UPLOADED", "PROCESSING", "READY", "FAILED"] as const;
+/** S3 multipart 上传允许的最小分片（最后一片除外），字节。 */
+export const MIN_UPLOAD_PART_BYTES = 5 * 1024 * 1024;
+/** 断点续传的默认分片大小，字节。 */
+export const DEFAULT_UPLOAD_PART_BYTES = 8 * 1024 * 1024;
+export const MAX_UPLOAD_PART_COUNT = 10_000;
 export const ANNOTATION_TYPES = ["RHYTHM", "FINGERING", "EMOTION"] as const;
 export const GOAL_CATEGORIES = [
   "RHYTHM",
@@ -201,10 +207,30 @@ export const createExportSchema = z.object({
   to: z.coerce.date().optional(),
 });
 
+export const uploadInitSchema = z.object({
+  originalName: requiredText("原始文件名", 255),
+  mimeType: requiredText("MIME 类型", 100),
+  sizeBytes: z.coerce.bigint().positive(),
+  sha256: z.string().regex(/^[a-fA-F0-9]{64}$/, "SHA-256 摘要格式不正确"),
+  partSize: z.coerce.number().int().min(MIN_UPLOAD_PART_BYTES).max(64 * 1024 * 1024).optional(),
+});
+export const uploadPartsQuerySchema = z.object({
+  partNumbers: z
+    .string()
+    .trim()
+    .min(1)
+    .max(20_000)
+    .transform((value) => [...new Set(value.split(",").map((item) => Number(item.trim())))])
+    .refine((parts) => parts.every((part) => Number.isInteger(part) && part >= 1 && part <= MAX_UPLOAD_PART_COUNT), {
+      message: "分片序号必须在 1 到 10000 之间",
+    }),
+});
+
 export const idSchema = z.string().uuid();
 
 export type SessionStatus = (typeof SESSION_STATUSES)[number];
 export type MediaStatus = (typeof MEDIA_STATUSES)[number];
+export type MediaObjectStatus = (typeof MEDIA_OBJECT_STATUSES)[number];
 export type AnnotationType = (typeof ANNOTATION_TYPES)[number];
 export type GoalCategory = (typeof GOAL_CATEGORIES)[number];
 export type MetricType = (typeof METRIC_TYPES)[number];
@@ -259,6 +285,28 @@ export function isGoalProgressValid(actualValue: number, targetValue: number): b
 
 export function calculateSessionDuration(mediaDurationsMs: Array<number | null | undefined>): number {
   return mediaDurationsMs.reduce<number>((total, duration) => total + (duration && duration > 0 ? duration : 0), 0);
+}
+
+/**
+ * 规划 S3 分片上传：选择合法分片大小并计算每片字节范围。
+ * 除最后一片外，每片都不得小于 S3 规定的 5 MiB。
+ */
+export function planMultipartUpload(
+  sizeBytes: number,
+  requestedPartSize = DEFAULT_UPLOAD_PART_BYTES,
+): { partSize: number; parts: Array<{ partNumber: number; start: number; end: number }> } {
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) {
+    throw new Error("文件大小必须是正整数");
+  }
+  let partSize = Math.max(MIN_UPLOAD_PART_BYTES, Math.floor(requestedPartSize));
+  if (Math.ceil(sizeBytes / partSize) > MAX_UPLOAD_PART_COUNT) {
+    partSize = Math.ceil(sizeBytes / MAX_UPLOAD_PART_COUNT);
+  }
+  const parts: Array<{ partNumber: number; start: number; end: number }> = [];
+  for (let start = 0, partNumber = 1; start < sizeBytes; start += partSize, partNumber += 1) {
+    parts.push({ partNumber, start, end: Math.min(start + partSize, sizeBytes) });
+  }
+  return { partSize, parts };
 }
 
 export function describeMissingReview(input: {

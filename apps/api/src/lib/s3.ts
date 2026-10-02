@@ -1,4 +1,18 @@
-import { CreateBucketCommand, DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
+  CreateBucketCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadBucketCommand,
+  HeadObjectCommand,
+  ListPartsCommand,
+  PutObjectCommand,
+  S3Client,
+  UploadPartCommand,
+  type CompletedPart,
+} from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
@@ -37,22 +51,85 @@ export function publicObjectUrl(objectKey: string): string {
   return `${base}/${config.S3_BUCKET}/${objectKey.split("/").map(encodeURIComponent).join("/")}`;
 }
 
-export async function createUploadUrl(objectKey: string, mimeType: string, sha256: string): Promise<string> {
+export async function createMultipartUpload(objectKey: string, mimeType: string, sha256: string): Promise<string> {
   const config = getConfig();
-  return getSignedUrl(
-    getPublicS3(),
-    new PutObjectCommand({
+  const result = await getS3().send(
+    new CreateMultipartUploadCommand({
       Bucket: config.S3_BUCKET,
       Key: objectKey,
       ContentType: mimeType,
       Metadata: { sha256 },
     }),
-    {
-      expiresIn: config.UPLOAD_URL_TTL_SECONDS,
-      signableHeaders: new Set(["content-type"]),
-      unhoistableHeaders: new Set(["x-amz-meta-sha256"]),
-    },
   );
+  if (!result.UploadId) throw new Error("S3 未返回 UploadId");
+  return result.UploadId;
+}
+
+export async function signUploadPart(objectKey: string, uploadId: string, partNumber: number): Promise<string> {
+  const config = getConfig();
+  return getSignedUrl(
+    getPublicS3(),
+    new UploadPartCommand({ Bucket: config.S3_BUCKET, Key: objectKey, UploadId: uploadId, PartNumber: partNumber }),
+    { expiresIn: config.UPLOAD_URL_TTL_SECONDS },
+  );
+}
+
+export interface UploadedPart {
+  partNumber: number;
+  etag: string;
+  size: number;
+}
+
+/**
+ * 查询 S3 端已存在的分片，用于网络恢复后只续传缺失对象。
+ */
+export async function listUploadedParts(
+  objectKey: string,
+  uploadId: string,
+): Promise<UploadedPart[]> {
+  const config = getConfig();
+  const parts: UploadedPart[] = [];
+  let partNumberMarker: string | undefined;
+  for (;;) {
+    const output = await getS3().send(
+      new ListPartsCommand({
+        Bucket: config.S3_BUCKET,
+        Key: objectKey,
+        UploadId: uploadId,
+        ...(partNumberMarker ? { PartNumberMarker: partNumberMarker } : {}),
+      }),
+    );
+    for (const part of output.Parts ?? []) {
+      if (part.PartNumber && part.ETag) {
+        parts.push({ partNumber: Number(part.PartNumber), etag: part.ETag.replace(/^"|"$/g, ""), size: Number(part.Size ?? 0) });
+      }
+    }
+    if (!output.IsTruncated) break;
+    partNumberMarker = output.NextPartNumberMarker;
+  }
+  return parts.sort((a, b) => a.partNumber - b.partNumber);
+}
+
+export async function completeMultipartUpload(
+  objectKey: string,
+  uploadId: string,
+  parts: UploadedPart[],
+): Promise<void> {
+  const config = getConfig();
+  const payload: CompletedPart[] = parts.map((part) => ({ PartNumber: part.partNumber, ETag: part.etag }));
+  await getS3().send(
+    new CompleteMultipartUploadCommand({
+      Bucket: config.S3_BUCKET,
+      Key: objectKey,
+      UploadId: uploadId,
+      MultipartUpload: { Parts: payload },
+    }),
+  );
+}
+
+export async function abortMultipartUpload(objectKey: string, uploadId: string): Promise<void> {
+  const config = getConfig();
+  await getS3().send(new AbortMultipartUploadCommand({ Bucket: config.S3_BUCKET, Key: objectKey, UploadId: uploadId }));
 }
 
 export async function createPlaybackUrl(objectKey: string, originalName: string, contentType?: string): Promise<string> {
@@ -106,4 +183,10 @@ export async function ensureBucket(): Promise<void> {
   } catch {
     await getS3().send(new CreateBucketCommand({ Bucket: config.S3_BUCKET }));
   }
+}
+
+// 兼容仅在导出任务中仍使用的简单 PUT。
+export async function putObject(objectKey: string, body: string | Buffer, contentType: string): Promise<void> {
+  const config = getConfig();
+  await getS3().send(new PutObjectCommand({ Bucket: config.S3_BUCKET, Key: objectKey, Body: body, ContentType: contentType }));
 }

@@ -95,8 +95,12 @@ npm run test:e2e
 - 密码使用 Argon2id；Access Token 只在浏览器内存保存。
 - Refresh Token 使用 `HttpOnly` Cookie 并每次轮换；检测到复用会撤销同一会话族。
 - 音频 Bucket 保持私有，播放 URL 默认 300 秒过期。
-- 上传先创建 `MediaAsset`，对象直传 S3/MinIO，确认时流式计算 SHA-256。
-- 同一用户重复上传相同 SHA-256 时复用已有对象，新练习只创建业务关联，不重复占用存储。
+- 上传先创建 `MediaAsset`，浏览器通过 S3 分片直传；网络恢复后按服务端 ListParts
+  结果只续传缺失分片，已传内容不重发。
+- 同一用户重复上传相同 SHA-256 时复用已有 `MediaObject` 物理对象，新练习只创建
+  业务引用；同摘要并发确认由数据库事务串行化，只产生一个物理对象、一次 ffprobe 探测。
+- 删除引用时以 `media_objects` 引用计数为准，最后一个引用删除才回收对象存储内容；
+  引用解除与物理回收均写审计日志，可按对象追溯。
 - Worker 禁止拼接 Shell 命令，统一使用参数数组调用 `ffprobe/ffmpeg`。
 - 所有资源查询都带 `userId` 条件，无法通过 ID 访问其他用户资源。
 - 删除练习进入后台清理队列，失败时保留 `DELETE_FAILED` 以便重试和审计。

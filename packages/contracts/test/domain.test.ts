@@ -4,7 +4,9 @@ import {
   canTransitionSession,
   describeMissingReview,
   isGoalProgressValid,
+  planMultipartUpload,
   validateAnnotationRange,
+  MIN_UPLOAD_PART_BYTES,
 } from "../src/index.js";
 
 describe("session state machine", () => {
@@ -46,5 +48,28 @@ describe("goal values", () => {
 
   it("sums only valid media durations", () => {
     expect(calculateSessionDuration([1000, null, 2500, -1])).toBe(3500);
+  });
+});
+
+describe("multipart upload planning", () => {
+  it("keeps a single part for small files", () => {
+    const plan = planMultipartUpload(12_345);
+    expect(plan.parts).toEqual([{ partNumber: 1, start: 0, end: 12_345 }]);
+  });
+
+  it("splits large files into contiguous non-overlapping ranges", () => {
+    const size = MIN_UPLOAD_PART_BYTES * 2 + 123;
+    const plan = planMultipartUpload(size, MIN_UPLOAD_PART_BYTES);
+    expect(plan.parts).toHaveLength(3);
+    expect(plan.parts[0]).toEqual({ partNumber: 1, start: 0, end: MIN_UPLOAD_PART_BYTES });
+    expect(plan.parts[1]).toEqual({ partNumber: 2, start: MIN_UPLOAD_PART_BYTES, end: MIN_UPLOAD_PART_BYTES * 2 });
+    expect(plan.parts[2]).toEqual({ partNumber: 3, start: MIN_UPLOAD_PART_BYTES * 2, end: size });
+  });
+
+  it("enlarges the part size when the part cap would be exceeded", () => {
+    const plan = planMultipartUpload(MIN_UPLOAD_PART_BYTES * 12_000, MIN_UPLOAD_PART_BYTES);
+    expect(plan.parts.length).toBeLessThanOrEqual(10_000);
+    expect(plan.partSize).toBeGreaterThan(MIN_UPLOAD_PART_BYTES);
+    expect(plan.parts.at(-1)!.end).toBe(MIN_UPLOAD_PART_BYTES * 12_000);
   });
 });

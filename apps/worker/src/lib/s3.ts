@@ -1,4 +1,11 @@
-import { GetObjectCommand, PutObjectCommand, S3Client, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import {
+  AbortMultipartUploadCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  PutObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
 import type { Readable } from "node:stream";
 import { getConfig } from "../config/env.js";
 
@@ -36,4 +43,22 @@ export async function putObject(objectKey: string, body: string, contentType: st
 
 export async function deleteObject(objectKey: string): Promise<void> {
   await getS3().send(new DeleteObjectCommand({ Bucket: getConfig().S3_BUCKET, Key: objectKey }));
+}
+
+/** 中止分片上传，释放已上传但未合并的分片占用的存储。 */
+export async function abortMultipartUpload(objectKey: string, uploadId: string): Promise<void> {
+  await getS3().send(
+    new AbortMultipartUploadCommand({ Bucket: getConfig().S3_BUCKET, Key: objectKey, UploadId: uploadId }),
+  );
+}
+
+/** 探测对象是否存在；404 视为不存在，其余错误向上抛出。 */
+export async function objectExists(objectKey: string): Promise<boolean> {
+  try {
+    await getS3().send(new HeadObjectCommand({ Bucket: getConfig().S3_BUCKET, Key: objectKey }));
+    return true;
+  } catch (error) {
+    if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) return false;
+    throw error;
+  }
 }

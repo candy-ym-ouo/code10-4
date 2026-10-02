@@ -1,5 +1,4 @@
 import { Queue } from "bullmq";
-import { getConfig } from "../config/env.js";
 import { getRedis } from "./redis.js";
 
 let queue: Queue | undefined;
@@ -11,21 +10,10 @@ export function getMediaQueue(): Queue {
   return queue;
 }
 
-export async function enqueueProbe(mediaId: string): Promise<void> {
-  await getMediaQueue().add(
-    "probe-media",
-    { mediaId },
-    {
-      jobId: `probe:${mediaId}:${Date.now()}`,
-      attempts: 3,
-      backoff: { type: "exponential", delay: 3000 },
-      removeOnComplete: 100,
-      removeOnFail: 500,
-    },
-  );
-}
-
 export async function enqueueCleanup(sessionId: string): Promise<void> {
+  // 同一会话已有待执行清理任务时复用，避免重复入队。
+  const active = await getMediaQueue().getJobs(["active", "waiting", "delayed"]);
+  if (active.some((job) => job.name === "cleanup-session" && job.data.sessionId === sessionId)) return;
   await getMediaQueue().add(
     "cleanup-session",
     { sessionId },
